@@ -1,0 +1,265 @@
+# Necessary imports
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from torchinfo import summary
+from tqdm import tqdm
+
+# For reproducibility
+torch.cuda.manual_seed(0)
+torch.manual_seed(0)
+torch.backends.cudnn.benchmark = True
+
+
+
+class TeacherModel(nn.Module):
+    def __init__(self, in_channels=1, num_classes=10):
+        super(TeacherModel, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=64,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+        )
+        self.pool = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
+        self.conv2 = nn.Conv2d(
+            in_channels=64,
+            out_channels=256,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+        )
+        self.fc1 = nn.Linear(256 * 7 * 7, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc1(x)
+        return x
+
+class StudentModel(nn.Module):
+    def __init__(self, in_channels=1, num_classes=10):
+        super(StudentModel, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=8,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+        )
+        self.pool = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
+        self.conv2 = nn.Conv2d(
+            in_channels=8,
+            out_channels=16,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+        )
+        self.fc1 = nn.Linear(16 * 7 * 7, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc1(x)
+        return x
+
+
+def check_accuracy(loader, model, device):
+    num_correct = 0
+    num_samples = 0
+    model.eval()
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            scores = model(x)
+            _, predictions = scores.max(1)
+            num_correct += (predictions == y).sum()
+            num_samples += predictions.size(0)
+
+    model.train()
+    return (num_correct / num_samples).item()
+
+
+def train_teacher(epochs):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    teacher_model = TeacherModel().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(teacher_model.parameters(), lr=1e-4)
+
+    for epoch in range(epochs):
+        teacher_model.train()
+        losses = []
+
+        pbar = tqdm(train_loader, total=len(train_loader), position=0, leave=True, desc=f"Epoch {epoch}")
+        for data, targets in pbar:
+            data = data.to(device)
+            targets = targets.to(device)
+
+            # forward
+            scores = teacher_model(data)
+            loss = criterion(scores, targets)
+            losses.append(loss.item())
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+
+            optimizer.step()
+
+        avg_loss = sum(losses) / len(losses)
+        acc = check_accuracy(test_loader, teacher_model, device)
+        print(f"Loss:{avg_loss:.2f}\tAccuracy:{acc:.2f}")
+
+    return teacher_model
+
+
+
+
+
+
+def train_step(
+        teacher_model,
+        student_model,
+        optimizer,
+        student_loss_fn,
+        divergence_loss_fn,
+        temp,
+        alpha,
+        epoch,
+        device
+):
+    losses = []
+    pbar = tqdm(train_loader, total=len(train_loader), position=0, leave=True, desc=f"Epoch {epoch}")
+    for data, targets in pbar:
+        # Get data to cuda if possible
+        data = data.to(device)
+        targets = targets.to(device)
+
+        # forward
+        with torch.no_grad():
+            teacher_preds = teacher_model(data)
+
+        student_preds = student_model(data)
+        student_loss = student_loss_fn(student_preds, targets)
+
+        ditillation_loss = divergence_loss_fn(
+            F.log_softmax(student_preds / temp, dim=1),
+            F.log_softmax(teacher_preds / temp, dim=1)
+        )
+        loss = alpha * student_loss + (1 - alpha) * ditillation_loss
+        losses.append(loss.item())
+
+        # backward
+        optimizer.zero_grad()
+        loss.backward()
+
+        optimizer.step()
+
+    avg_loss = sum(losses) / len(losses)
+    return avg_loss
+
+
+def main(epochs, teacher, student, temp=7, alpha=0.3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    teacher = teacher.to(device)
+    student = student.to(device)
+    student_loss_fn = nn.CrossEntropyLoss()
+    divergence_loss_fn = nn.KLDivLoss(reduction="batchmean")
+    optimizer = torch.optim.Adam(student.parameters(), lr=1e-4)
+
+    teacher.eval()
+    student.train()
+    for epoch in range(epochs):
+        loss = train_step(
+            teacher,
+            student,
+            optimizer,
+            student_loss_fn,
+            divergence_loss_fn,
+            temp,
+            alpha,
+            epoch,
+            device
+        )
+        acc = check_accuracy(test_loader, student, device)
+        print(f"Loss:{loss:.2f}\tAccuracy:{acc:.2f}")
+
+
+def train_student(epochs):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    student_model = StudentModel().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=1e-4)
+
+    for epoch in range(epochs):
+        student_model.train()
+        losses = []
+
+        pbar = tqdm(train_loader, total=len(train_loader), position=0, leave=True, desc=f"Epoch {epoch}")
+        for data, targets in pbar:
+            data = data.to(device)
+            targets = targets.to(device)
+
+            # forward
+            scores = student_model(data)
+            loss = criterion(scores, targets)
+            losses.append(loss.item())
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+
+            optimizer.step()
+
+        avg_loss = sum(losses) / len(losses)
+        acc = check_accuracy(test_loader, student_model, device)
+        print(f"Loss:{avg_loss:.2f}\tAccuracy:{acc:.2f}")
+
+    return student_model
+
+
+if __name__=='__main__':
+
+    # Load mnist dataset
+    train_dataset = torchvision.datasets.MNIST(
+        root=r"E:\dataset",
+        train=True,
+        transform=transforms.ToTensor(),
+        download=True
+    )
+
+    test_dataset = torchvision.datasets.MNIST(
+        root=r"E:\dataset",
+        train=False,
+        transform=transforms.ToTensor(),
+        download=True
+    )
+    # Create train and test dataloaders
+    train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(dataset=test_dataset, batch_size=32, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("训练教师模型")
+    # 单纯教师模型训练
+    teacher_model = train_teacher(3)
+    student_model = StudentModel().to(device)
+
+    print("蒸馏")
+    # 蒸馏学习
+    main(3, teacher_model, student_model)
+
+    print("无教师的学生训练")
+    #单纯学生模型训练
+    single_student_model = train_student(3)
